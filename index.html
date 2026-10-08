@@ -77,8 +77,8 @@
 
   /* ---------- classifier (left) ---------- */
   #stage{position:relative;width:100%;background:#000;border-radius:12px;overflow:hidden;aspect-ratio:4/3;}
-  canvas#canvas{width:100%;height:100%;display:block;}
-  video{display:none;}
+  #video,canvas#canvas{position:absolute;inset:0;width:100%;height:100%;display:block;}
+  #video{object-fit:fill;transform:scaleX(-1);background:#000;}
   #overlay{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:10px;background:rgba(0,0,0,.7);text-align:center;padding:16px;}
   #start{background:#238636;color:#fff;border:0;padding:12px 22px;border-radius:8px;font-size:15px;cursor:pointer;}
   #start:disabled{opacity:.6;cursor:default;}
@@ -230,8 +230,8 @@
         </div>
         <div class="panel bar">
           <label>Extra objects <input class="plain" id="extra" type="text" placeholder="e.g. earbuds case, rubik's cube"></label>
-          <label>Min confidence <input id="thr" type="range" min="0.1" max="0.9" step="0.05" value="0.35"><span id="thrV">0.35</span></label>
-          <label><input id="wgpu" type="checkbox"> Try WebGPU (faster, reload)</label>
+          <label>Min confidence <input id="thr" type="range" min="0.02" max="0.9" step="0.01" value="0.05"><span id="thrV">0.05</span></label>
+          <label><input id="wgpu" type="checkbox"> Use GPU / WebGPU (fastest, reload)</label>
         </div>
       </div>
     </section>
@@ -755,6 +755,7 @@ window.motorOf=function(id,v){
   });
   renderer.domElement.addEventListener('wheel', function(e){
     e.preventDefault();
+    if (window.__rigPoke) window.__rigPoke(1500);
     camDist = Math.max(3, Math.min(10, camDist + e.deltaY*0.003));
     autoFocusActive = false;
     if (autoFocusMode === 'manual-orbit') updateCam();
@@ -1637,11 +1638,18 @@ window.motorOf=function(id,v){
   // tween/playback is actively in flight (playbackActive), force the
   // camera update to run regardless of any earlier manual-drag flag.
   var playbackActive = false;
-  var __lastR = 0; window.__rigBusyUntil = performance.now() + 4000;
+  var __lastR = 0, __rigDirtyUntil = performance.now() + 3000;
+  window.__rigPoke = function(ms){ __rigDirtyUntil = Math.max(__rigDirtyUntil, performance.now() + (ms || 1500)); };
   function animate(now){
     requestAnimationFrame(animate);
     now = now || performance.now();
-    if (now - __lastR < (now < (window.__rigBusyUntil || 0) ? 30 : 250)) return;
+    if (now - __lastR < 33) return;
+    // idle = nothing to draw: keeps the GPU/CPU free for the camera + AI
+    var camMoving = false;
+    if (autoFocusMode !== 'manual-orbit' && (playbackActive || (autoFocusEnabled && autoFocusActive))){
+      camMoving = camPos.distanceToSquared(handTargetPos) > 1e-4 || camLookAt.distanceToSquared(handTargetLookAt) > 1e-4;
+    }
+    if (!(playbackActive || isDragging || camMoving || now < __rigDirtyUntil)) return;
     __lastR = now;
     updateGyroCube(); // keep the stable cube tracking the joint's position every frame, regardless of which slider moved
     if (playbackActive || (autoFocusEnabled && autoFocusActive)){
@@ -1654,6 +1662,7 @@ window.motorOf=function(id,v){
   animate();
 
   window.addEventListener('resize', function(){
+    if (window.__rigPoke) window.__rigPoke(1500);
     camera.aspect = host.clientWidth/host.clientHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(host.clientWidth, host.clientHeight);
@@ -1716,6 +1725,7 @@ window.motorOf=function(id,v){
     }
     scene.updateMatrixWorld(true);
     fingerViewStale = true;
+    if (window.__rigPoke) window.__rigPoke(1200);
     if (!opts.silent){
       // Choose the most sensible camera framing for a fully-applied pose —
       // fingers view covers the common case (hand-only gestures); playback
@@ -2210,15 +2220,18 @@ window.motorOf=function(id,v){
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
 <script type="module">
-import { FilesetResolver, HandLandmarker }
+import { FilesetResolver, HandLandmarker, ObjectDetector }
   from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
-import { AutoTokenizer, AutoProcessor, CLIPTextModelWithProjection, CLIPVisionModelWithProjection, RawImage, env }
+import { AutoTokenizer, CLIPTextModelWithProjection, CLIPVisionModelWithProjection, Tensor, env }
   from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.2";
 
 const $ = id => document.getElementById(id);
 const WASM = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
 const HAND = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
-const CLIP_ID = "Xenova/clip-vit-base-patch16";   // more accurate than patch32
+const DET = "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite";
+const CLIP_BIG  = "Xenova/clip-vit-base-patch16";   // most accurate - used on the GPU (WebGPU)
+const CLIP_FAST = "Xenova/clip-vit-base-patch32";   // 4x cheaper  - used when only the CPU path is available
+let CLIP_ID = CLIP_FAST;
 
 /* The hand tracker only tells us WHERE to look. CLIP then decides WHAT is in the hand,
    asked as "a photo of a hand holding X" so the hand itself is never the answer. */
@@ -2231,41 +2244,86 @@ const VOCAB = [
   "screwdriver","hammer","pliers","wrench","tape measure","lighter","matchbox","padlock","spray bottle","medicine bottle","tablet pills","thermometer","soap bar","sponge","towel","tissue paper",
   "ball","toy car","teddy bear","rubik's cube","dice","playing card","toy","bag","handbag","backpack","umbrella","hat","flower","stone","plant","car key fob","vase","jar"
 ];
-const TEMPL = ["a photo of a hand holding {}.", "a close-up photo of a hand holding {}.", "a person holds {} in their hand.", "a hand grasping {}.", "{} held up in front of a camera.", "a sharp photo of {} in a palm."];
+const TEMPL = ["a photo of a hand holding {}.", "a close-up photo of a hand holding {}.", "a person holds {} in their hand.", "a hand grasping {}.", "{} held up in front of a camera.", "a sharp photo of {} in a palm.", "a photo of {}."];
 const EMPTY = ["a photo of an empty open hand.", "a photo of a bare hand with nothing in it.", "a photo of a closed fist.", "a photo of a hand showing the palm."];
+/* near-identical things split the probability between them ("cup" / "mug" / "paper cup").
+   Their probabilities are added up so the confidence is meaningful; the best-matching name is still the one shown. */
+const GROUPS = [
+  ["water bottle", "plastic bottle"], ["cup", "coffee mug", "paper cup", "glass of water"],
+  ["charging cable", "usb cable", "hdmi cable", "ethernet cable", "extension cord"], ["earbuds", "wired earphones"], ["pen", "pencil"],
+  ["id card", "credit card"], ["keys", "key chain"], ["glasses", "sunglasses"], ["bag", "handbag"]
+];
+/* typed "extra objects" are corrected so a typo like "sissors" becomes the real label instead of a separate, unknown one */
+const SPELL = { sissors:"scissors", sissor:"scissors", scisors:"scissors", scissor:"scissors", scissers:"scissors", sizzors:"scissors", sicssors:"scissors",
+  cellphone:"smartphone", phone:"smartphone", mobile:"smartphone", "mobile phone":"smartphone", specs:"glasses", earphones:"wired earphones", charger:"phone charger adapter",
+  remote:"tv remote control", mouse:"computer mouse", key:"keys", bottle:"water bottle", flashdrive:"usb flash drive", "pen drive":"usb flash drive", pendrive:"usb flash drive" };
+/* things CLIP over-guesses for any thin object held in a hand get a handicap */
+const PRIOR = { "usb cable":0.4, "charging cable":0.45, "hdmi cable":0.35, "ethernet cable":0.35, "extension cord":0.45, "wired earphones":0.55, "usb flash drive":0.55,
+  "tablet pills":0.55, "nail clipper":0.55, "airpods case":0.7, "lip balm":0.8 };
+/* extra descriptions averaged into a label so it is recognised from more angles */
+const ALIAS = {
+  "scissors": ["a pair of scissors", "scissors with two blades and finger loops", "sewing scissors with plastic handles"],
+  "pen": ["a ballpoint pen", "a pen with a clip and cap"], "pencil": ["a wooden pencil"], "marker": ["a marker pen"],
+  "usb flash drive": ["a small usb thumb drive"], "keys": ["a bunch of metal keys"], "smartphone": ["a mobile phone", "a phone with a screen"]
+};
+/* background things the crop might show instead of an object (so a face / wall crop is not forced into a name) */
+const BG = ["a photo of a person's face.", "a photo of a plain wall.", "a photo of a room with furniture.", "a photo of a t-shirt.", "a photo of a blurry background.", "a photo of a window with curtains."];
+/* what the COCO detector calls things -> our label names (the detector gives a tight box and a hint) */
+const COCO = { scissors:"scissors", "cell phone":"smartphone", remote:"tv remote control", mouse:"computer mouse", keyboard:"keyboard", bottle:"water bottle", cup:"cup", knife:"knife",
+  fork:"fork", spoon:"spoon", bowl:"bowl", book:"book", clock:"clock", vase:"vase", toothbrush:"toothbrush", laptop:"laptop", banana:"banana", apple:"apple", orange:"orange",
+  "sports ball":"ball", umbrella:"umbrella", backpack:"backpack", handbag:"handbag", "teddy bear":"teddy bear" };
+const DET_SKIP = new Set(["person", "chair", "couch", "bed", "dining table", "tv", "toilet", "sink", "refrigerator", "oven", "microwave", "potted plant", "bench"]);
 
 const video = $("video"), canvas = $("canvas"), ctx = canvas.getContext("2d");
-const clean = document.createElement("canvas"), cleanCtx = clean.getContext("2d");
-const crop = document.createElement("canvas"); crop.width = crop.height = 224; const cctx = crop.getContext("2d");
+const crop = document.createElement("canvas"); crop.width = crop.height = 224;
+const cctx = crop.getContext("2d", { willReadFrequently: true }); cctx.imageSmoothingQuality = "high";
 const store = { get(k){ try{return localStorage.getItem(k);}catch{return null;} }, set(k,v){ try{localStorage.setItem(k,v);}catch{} } };
-let camStream = null, handLm, running = false, lastTime = -1, lastTs = 0, fps = 0, prev = performance.now(), inferMs = 0, ready = false, loadMsg = "";
-const hs = [];   // per hand: smoothed box, crop windows, vote history, candidates
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[c]));
+let camStream = null, handLm, running = false, lastTime = -1, lastTs = 0, fps = 0, prev = performance.now(), inferMs = 0, ready = false, loadMsg = "", lostT = 0, lastUI = 0, frozenAt = 0;
+const hs = [];   // per hand: smoothed box, object proposals, vote history
+let labelIx = new Map(), members = [], prior = new Float32Array(0), objDet = null, dets = [], detT = 0, lastTsD = 0, frameN = 0;
 
+const gpuOK = "gpu" in navigator;
 $("extra").value = store.get("extra") || "";
-$("wgpu").checked = store.get("wgpu") === "1";
+$("wgpu").checked = gpuOK && store.get("wgpu") !== "0";      // GPU path is the default whenever the browser has it
+$("wgpu").disabled = !gpuOK;
 $("wgpu").onchange = () => store.set("wgpu", $("wgpu").checked ? "1" : "0");
-$("thr").oninput = () => $("thrV").textContent = (+$("thr").value).toFixed(2);
+let thr = parseFloat(store.get("thr")); if (!(thr >= 0.02 && thr <= 0.9)) thr = 0.05;
+$("thr").value = thr; $("thrV").textContent = thr.toFixed(2);
+$("thr").oninput = () => { thr = +$("thr").value; $("thrV").textContent = thr.toFixed(2); store.set("thr", thr); };
 
 /* ---------- CLIP (local) ---------- */
-let tokenizer, processor, textModel, visionModel, labels = [], rowKinds = [], rowLabel = [], textEmb = null, D = 512;
+let tokenizer, textModel, visionModel, labels = [], rowKinds = [], rowLabel = [], textEmb = null, D = 512, gid = new Int32Array(0), nG = 0;
 env.allowLocalModels = false; env.useBrowserCache = true;
-try { env.backends.onnx.wasm.proxy = true; } catch {}
 try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch {}
 let clipOpt = null;
-const progressCb = p => { if (p.status === "progress" && p.file) loadMsg = store.get("clipCached") === "1" ? "Loading AI model from cache…" : `Downloading ${p.file.split("/").pop()} ${Math.round(p.progress || 0)}%`; };
+const cacheKey = () => "clipCached|" + CLIP_ID + "|" + (clipOpt ? clipOpt.dtype : "");
+const progressCb = p => { if (p.status === "progress" && p.file) loadMsg = store.get(cacheKey()) === "1" ? "Loading AI model from cache…" : `Downloading ${p.file.split("/").pop()} ${Math.round(p.progress || 0)}%`; };
+
+/* one dummy look: compiles the GPU shaders up front and proves the model gives sane numbers */
+async function warmup() {
+  const { image_embeds } = await visionModel({ pixel_values: new Tensor("float32", new Float32Array(3 * 224 * 224), [1, 3, 224, 224]) });
+  const d = image_embeds.data; let s = 0;
+  for (let i = 0; i < d.length; i++) { if (!Number.isFinite(d[i])) throw new Error("model returned invalid numbers"); s += d[i] * d[i]; }
+  if (!(s > 0)) throw new Error("model returned an empty result");
+}
 async function loadClip() {
-  const wantGpu = $("wgpu").checked && "gpu" in navigator;
-  const attempts = wantGpu ? [{ device: "webgpu", dtype: "fp32" }, { device: "wasm", dtype: "q8" }] : [{ device: "wasm", dtype: "q8" }];
+  const wantGpu = $("wgpu").checked && gpuOK;
+  const attempts = [];
+  if (wantGpu) attempts.push({ id: CLIP_BIG, device: "webgpu", dtype: "fp16", proxy: false }, { id: CLIP_BIG, device: "webgpu", dtype: "fp32", proxy: false });
+  attempts.push({ id: CLIP_FAST, device: "wasm", dtype: "q8", proxy: true },      // runs in a worker thread: never freezes the video
+                { id: CLIP_FAST, device: "wasm", dtype: "q8", proxy: false });
   let err;
-  for (const opt of attempts) {
+  for (const a of attempts) {
     try {
-      loadMsg = `Loading AI model (${opt.device})…`;
-      tokenizer = await AutoTokenizer.from_pretrained(CLIP_ID);
-      processor = await AutoProcessor.from_pretrained(CLIP_ID);
-      clipOpt = opt;
-      visionModel = await CLIPVisionModelWithProjection.from_pretrained(CLIP_ID, { ...opt, progress_callback: progressCb });
+      loadMsg = `Loading AI model (${a.device}${a.device === "webgpu" ? " " + a.dtype : ""})…`;
+      try { env.backends.onnx.wasm.proxy = a.proxy; } catch {}
+      CLIP_ID = a.id; clipOpt = { device: a.device, dtype: a.dtype };
+      tokenizer = await AutoTokenizer.from_pretrained(a.id);
+      visionModel = await CLIPVisionModelWithProjection.from_pretrained(a.id, { ...clipOpt, progress_callback: progressCb });
+      await warmup();
       return;
-    } catch (e) { console.warn(e); err = e; try { env.backends.onnx.wasm.proxy = false; } catch {} }
+    } catch (e) { console.warn("model attempt failed", a, e); err = e; visionModel = null; }
   }
   throw err;
 }
@@ -2277,7 +2335,10 @@ function normRows(data, n, d) {
 async function ensureText() {
   if (textModel) return;
   loadMsg = "Loading text model (one time only)…";
-  textModel = await CLIPTextModelWithProjection.from_pretrained(CLIP_ID, { ...clipOpt, progress_callback: progressCb });
+  const tries = [clipOpt]; if (clipOpt.device === "webgpu" && clipOpt.dtype !== "fp32") tries.push({ device: "webgpu", dtype: "fp32" });
+  let err;
+  for (const o of tries) { try { textModel = await CLIPTextModelWithProjection.from_pretrained(CLIP_ID, { ...o, progress_callback: progressCb }); return; } catch (e) { console.warn(e); err = e; } }
+  throw err;
 }
 const idb = (mode, fn) => new Promise((res, rej) => { const r = indexedDB.open("zippy-clip", 1); r.onupgradeneeded = () => r.result.createObjectStore("kv"); r.onerror = () => rej(r.error); r.onsuccess = () => { const tx = r.result.transaction("kv", mode), q = fn(tx.objectStore("kv")); tx.oncomplete = () => res(q.result); tx.onerror = () => rej(tx.error); }; });
 async function cachedEmbed(prompts) {
@@ -2300,78 +2361,169 @@ async function embedPrompts(prompts) {
 const article = l => (/^(a|an|the|some)\b/i.test(l) ? l : (/s$/i.test(l) ? "" : (/^[aeiou]/i.test(l) ? "an " : "a ")) + l);
 async function buildText() {
   ready = false;
-  const extra = $("extra").value.split(",").map(s => s.trim()).filter(Boolean);
+  const extra = [...new Set($("extra").value.split(",").map(s => s.trim().toLowerCase()).filter(Boolean).map(s => SPELL[s] || s))];
+  const extraSet = new Set(extra);
   labels = [...new Set([...extra, ...VOCAB])];
-  const prompts = [];
-  for (const l of labels) for (const t of TEMPL) prompts.push(t.replace("{}", article(l)));
+  labelIx = new Map(labels.map((l, i) => [l, i]));
+  // synonym groups
+  gid = new Int32Array(labels.length); nG = 0;
+  const used = new Set();
+  for (const grp of GROUPS) { const mem = grp.map(l => labelIx.get(l)).filter(i => i !== undefined); if (mem.length > 1) { mem.forEach(i => { gid[i] = nG; used.add(i); }); nG++; } }
+  for (let i = 0; i < labels.length; i++) if (!used.has(i)) gid[i] = nG++;
+  members = Array.from({ length: nG }, () => []); labels.forEach((_, j) => members[gid[j]].push(j));
+
+  const prompts = [], counts = [];
+  for (const l of labels) { const nm = [l, ...(ALIAS[l] || [])]; counts.push(nm.length * TEMPL.length); for (const n of nm) for (const t of TEMPL) prompts.push(t.replace("{}", article(n))); }
   for (const e of EMPTY) prompts.push(e);
-  const all = await cachedEmbed(prompts), T = TEMPL.length;
-  textEmb = new Float32Array((labels.length + EMPTY.length) * D); rowKinds = []; rowLabel = [];
+  for (const g of BG) prompts.push(g);
+  const all = await cachedEmbed(prompts), nRows = labels.length + 1 + BG.length;
+  textEmb = new Float32Array(nRows * D); rowKinds = []; rowLabel = []; prior = new Float32Array(nRows).fill(1);
+  let off = 0;
   for (let li = 0; li < labels.length; li++) {
     const acc = new Float32Array(D);
-    for (let t = 0; t < T; t++) { const o = (li * T + t) * D; for (let j = 0; j < D; j++) acc[j] += all[o + j]; }
+    for (let t = 0; t < counts[li]; t++) { const o = (off + t) * D; for (let j = 0; j < D; j++) acc[j] += all[o + j]; }
+    off += counts[li];
     textEmb.set(normRows(acc, 1, D), li * D); rowKinds.push("obj"); rowLabel.push(labels[li]);
+    prior[li] = (PRIOR[labels[li]] || 1) * (extraSet.has(labels[li]) ? 1.8 : 1);      // what you typed as "extra" is probably really there
   }
-  for (let e = 0; e < EMPTY.length; e++) { const o = (labels.length * T + e) * D; textEmb.set(all.subarray(o, o + D), (labels.length + e) * D); rowKinds.push("empty"); rowLabel.push("(empty)"); }
+  // all "empty hand" prompts become ONE row, exactly like every object
+  const eacc = new Float32Array(D);
+  for (let e = 0; e < EMPTY.length; e++) { const o = (off + e) * D; for (let j = 0; j < D; j++) eacc[j] += all[o + j]; }
+  off += EMPTY.length;
+  textEmb.set(normRows(eacc, 1, D), labels.length * D); rowKinds.push("empty"); rowLabel.push("(empty)");
+  for (let g = 0; g < BG.length; g++) { const o = (off + g) * D; textEmb.set(all.subarray(o, o + D), (labels.length + 1 + g) * D); rowKinds.push("bg"); rowLabel.push("(bg)"); }
   ready = true; loadMsg = "";
 }
+const votesReset = () => hs.forEach(s => s && (s.hist = [], s.lg = -1, s.rep = -1, s.res = null, s.resT = 0, s.ob = null));
 $("extra").onchange = async () => { store.set("extra", $("extra").value); if (visionModel) { votesReset(); await buildText(); } };
-const votesReset = () => hs.forEach(s => s && (s.hist = [], s.leader = -1));
 
-async function classify() {
-  let img; try { img = RawImage.fromCanvas(crop); } catch { img = await RawImage.fromURL(crop.toDataURL("image/jpeg", 0.92)); }
-  const { image_embeds } = await visionModel(await processor(img));
+/* CLIP pixel input built by hand (skips the slow generic image processor) */
+const MEAN = [0.48145466, 0.4578275, 0.40821073], STD = [0.26862954, 0.26130258, 0.27577711];
+function cropTensor() {
+  const d = cctx.getImageData(0, 0, 224, 224).data, n = 224 * 224, out = new Float32Array(3 * n);
+  const m0 = MEAN[0] * 255, m1 = MEAN[1] * 255, m2 = MEAN[2] * 255, s0 = 1 / (STD[0] * 255), s1 = 1 / (STD[1] * 255), s2 = 1 / (STD[2] * 255);
+  for (let i = 0, k = 0; i < n; i++, k += 4) { out[i] = (d[k] - m0) * s0; out[n + i] = (d[k + 1] - m1) * s1; out[2 * n + i] = (d[k + 2] - m2) * s2; }
+  return new Tensor("float32", out, [1, 3, 224, 224]);
+}
+async function classify(det) {
+  const { image_embeds } = await visionModel({ pixel_values: cropTensor() });
   const v = normRows(image_embeds.data, 1, D), P = rowKinds.length, s = new Float32Array(P);
   let mx = -1e9;
   for (let p = 0; p < P; p++) { let d = 0; const o = p * D; for (let j = 0; j < D; j++) d += v[j] * textEmb[o + j]; s[p] = d; if (d > mx) mx = d; }
   let sum = 0; const e = new Float32Array(P);
-  for (let p = 0; p < P; p++) { e[p] = Math.exp(100 * (s[p] - mx)); sum += e[p]; }
-  let emptyP = 0; const probs = new Float32Array(labels.length);
-  for (let p = 0; p < P; p++) { const pr = e[p] / sum; if (rowKinds[p] === "empty") emptyP += pr; else probs[p] = pr; }
-  return { probs, emptyP };
+  for (let p = 0; p < P; p++) { e[p] = Math.exp(100 * (s[p] - mx)) * prior[p]; sum += e[p]; }
+  let emptyP = 0, bgP = 0; const probs = new Float32Array(labels.length);
+  for (let p = 0; p < P; p++) { const pr = e[p] / sum; if (rowKinds[p] === "empty") emptyP += pr; else if (rowKinds[p] === "bg") bgP += pr; else probs[p] = pr; }
+  // the object detector recognised this exact crop as a known thing: let it vote too
+  if (det) {
+    const ix = labelIx.get(det.lab);
+    if (ix !== undefined) { const w = Math.min(0.6, det.score * 0.8); for (let j = 0; j < probs.length; j++) probs[j] *= 1 - w; emptyP *= 1 - w; bgP *= 1 - w; probs[ix] += w; }
+  }
+  return { probs, emptyP, bgP };
+}
+async function fallbackToCpu() {          // GPU died / misbehaved -> reload on the CPU path automatically
+  ready = false; $("wgpu").checked = false; store.set("wgpu", "0"); visionModel = null; textModel = null; textEmb = null;
+  await loadClip(); await buildText();
 }
 
 /* ---------- start ---------- */
+const schedule = () => { if (!running) return; if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(onFrame); else requestAnimationFrame(onFrame); };
 $("start").onclick = async () => {
   $("start").disabled = true;
   try {
     $("msg").textContent = "Loading hand tracker…";
     const vision = await FilesetResolver.forVisionTasks(WASM);
-    const o = d => ({ baseOptions: { modelAssetPath: HAND, delegate: d }, runningMode: "VIDEO", numHands: 2, minHandDetectionConfidence: 0.5, minHandPresenceConfidence: 0.5, minTrackingConfidence: 0.5 });
+    const o = d => ({ baseOptions: { modelAssetPath: HAND, delegate: d }, runningMode: "VIDEO", numHands: 2, minHandDetectionConfidence: 0.4, minHandPresenceConfidence: 0.4, minTrackingConfidence: 0.4 });
     try { handLm = await HandLandmarker.createFromOptions(vision, o("GPU")); } catch { handLm = await HandLandmarker.createFromOptions(vision, o("CPU")); }
+    $("msg").textContent = "Loading object finder…";
+    try {
+      const od = d => ({ baseOptions: { modelAssetPath: DET, delegate: d }, runningMode: "VIDEO", scoreThreshold: 0.2, maxResults: 8 });
+      try { objDet = await ObjectDetector.createFromOptions(vision, od("GPU")); } catch { objDet = await ObjectDetector.createFromOptions(vision, od("CPU")); }
+    } catch (e) { console.warn("object finder unavailable", e); objDet = null; }
     $("msg").textContent = "Starting camera…";
-    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: "user" }, audio: false });
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 }, facingMode: "user" }, audio: false });
     camStream = stream; video.srcObject = stream; await video.play();
-    canvas.width = clean.width = video.videoWidth; canvas.height = clean.height = video.videoHeight;
+    canvas.width = video.videoWidth; canvas.height = video.videoHeight;
     $("stage").style.aspectRatio = `${video.videoWidth}/${video.videoHeight}`;
-    $("overlay").style.display = "none"; running = true; requestAnimationFrame(loop);
-    await loadClip(); store.set("clipCached", "1"); await buildText(); classifyLoop();
+    $("overlay").style.display = "none"; running = true; schedule();
+    await loadClip(); store.set(cacheKey(), "1"); await buildText(); classifyLoop();
   } catch (e) { console.error(e); $("overlay").style.display = "flex"; $("msg").textContent = "Error: " + (e.message || e); $("start").disabled = false; }
 };
 
-/* ---------- classification loop: 3 crop scales per hand, results are voted over 2 s ---------- */
+/* ---------- classification loop ----------
+   Runs beside the video (GPU / worker thread), one look after another: medium crop first, then tight, then wide.
+   Every look is stored as a full probability vector and voted on in evaluate(). */
 async function classifyLoop() {
-  let turn = 0; const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  let turn = 0, errs = 0;
   while (true) {
     const n = hs.length;
-    if (!ready || !n || pending || tickOn) { await sleep(120); continue; }
-    const i = turn % n, st = hs[i], view = (turn / n | 0) % 3; turn++;
-    if (!st || !st.win || st.sp > 0.1) { await sleep(40); continue; }
-    const w = st.win[view];
+    if (!ready || !n || pending || tickOn) { await sleep(60); continue; }
+    const i = turn % n, round = (turn / n) | 0; turn++;
+    const st = hs[i];
+    if (!st || !st.live || !st.c || !st.props || !st.props.length || (st.sp || 0) > 0.14) { await sleep(15); continue; }   // only skip when the hand is whipping around
+    const w = st.props[round % st.props.length], vw = video.videoWidth;
+    const det = w.det && labelIx.has(w.det.lab) ? w.det : null;
     cctx.fillStyle = "#808080"; cctx.fillRect(0, 0, 224, 224);
-    cctx.drawImage(clean, clean.width - w.x - w.s, w.y, w.s, w.s, 0, 0, 224, 224);
+    cctx.drawImage(video, vw - w.x - w.s, w.y, w.s, w.s, 0, 0, 224, 224);
     const t0 = performance.now();
     try {
-      const r = await classify(); inferMs = performance.now() - t0;
-      const now = performance.now();
-      st.hist.push({ t: now, p: r.probs, e: r.emptyP });          // keep the FULL probability vector of every look
-      if (st.hist.length > 18) st.hist.shift();
-    } catch (e) { console.error(e); loadMsg = "Inference error: " + (e.message || e); await sleep(400); }
-    await sleep(90);
+      const r = await classify(det), t1 = performance.now();
+      inferMs = inferMs ? inferMs * 0.7 + (t1 - t0) * 0.3 : t1 - t0; errs = 0;
+      if (st === hs[i]) { st.hist.push({ t: t1, p: r.probs, e: r.emptyP, b: r.bgP, k: w.k, box: { dx: w.x + w.s / 2 - st.c.x, dy: w.y + w.s / 2 - st.c.y, s: w.s },
+        det: det && { lab: det.lab, score: det.score, tight: { dx: det.tight.x + det.tight.w / 2 - st.c.x, dy: det.tight.y + det.tight.h / 2 - st.c.y, w: det.tight.w, h: det.tight.h } } }); if (st.hist.length > 20) st.hist.shift(); st.resT = 0; }
+    } catch (e) {
+      console.error(e); errs++; loadMsg = "Inference error: " + (e.message || e);
+      if (errs >= 3 && clipOpt && clipOpt.device === "webgpu") { try { await fallbackToCpu(); } catch (e2) { console.error(e2); } errs = 0; }
+      else await sleep(300);
+    }
+    await sleep(8);
   }
 }
 
-/* ---------- render loop ---------- */
+/* ---------- voting: recent looks count most, so a new object is named within a fraction of a second ---------- */
+function evaluate(st, now) {
+  const nL = labels.length;
+  st.hist = st.hist.filter(h => now - h.t < 2600 && h.p.length === nL);
+  if (!st.hist.length || !nL) return null;
+  const acc = new Float32Array(nL); let ws = 0, wo = 0, emp = 0, bgs = 0;
+  for (const h of st.hist) {
+    const tw = Math.exp(-(now - h.t) / 700), obj = Math.max(0, 1 - h.e - h.b);
+    ws += tw; wo += tw * obj; emp += tw * h.e; bgs += tw * h.b;
+    const p = h.p; for (let j = 0; j < nL; j++) acc[j] += tw * p[j];
+  }
+  const objFrac = wo / ws; emp /= ws; bgs /= ws;
+  if (wo < 1e-6) return { name: "", p: 0, n: st.hist.length, margin: 99, isEmpty: true, cands: [], box: null, tight: null };
+  for (let j = 0; j < nL; j++) acc[j] /= wo;               // distribution over objects, using only looks that actually showed an object
+  const gT = new Float32Array(nG), gB = new Int32Array(nG).fill(-1);
+  for (let j = 0; j < nL; j++) { const g = gid[j]; gT[g] += acc[j]; if (gB[g] < 0 || acc[j] > acc[gB[g]]) gB[g] = j; }
+  const top = [];
+  for (let g = 0; g < nG; g++) if (top.length < 5 || gT[g] > gT[top[top.length - 1]]) { top.push(g); top.sort((a, b) => gT[b] - gT[a]); if (top.length > 5) top.pop(); }
+  // the leader only changes when a challenger is clearly better (no flicker)
+  if (st.lg === undefined || st.lg < 0 || st.lg >= nG || gT[top[0]] > gT[st.lg] * 1.15) st.lg = top[0];
+  const best = gB[st.lg];
+  if (st.rep === undefined || st.rep < 0 || st.rep >= nL || gid[st.rep] !== st.lg || acc[best] > acc[st.rep] * 1.3) st.rep = best;
+  const sc = Math.min(1, Math.max(0.65, objFrac / 0.25));   // fewer "object" looks -> less sure
+  const p = gT[st.lg] * sc, other = top.find(g => g !== st.lg);
+
+  // WHERE the object is: weight every recent look by how strongly it saw the leading object
+  const mem = members[st.lg]; let qs = 0, qx = 0, qy = 0, qz = 0, tight = null, tightT = 0;
+  for (const h of st.hist) {
+    const tw = Math.exp(-(now - h.t) / 700); let pg = 0; for (const j of mem) pg += h.p[j];
+    const q = tw * pg * pg * pg;
+    if (h.box && h.k !== "wide") { qs += q; qx += q * h.box.dx; qy += q * h.box.dy; qz += q * h.box.s; }
+    if (h.det && now - h.t < 900 && h.t > tightT && gid[labelIx.get(h.det.lab)] === st.lg) { tight = h.det.tight; tightT = h.t; }
+  }
+  return {
+    name: labels[st.rep], p, n: st.hist.length,
+    margin: other === undefined ? 99 : gT[st.lg] / Math.max(gT[other], 1e-6),
+    isEmpty: (emp > 0.3 && emp > objFrac * gT[top[0]]) || emp + bgs > 0.85,
+    box: qs > 1e-6 ? { dx: qx / qs, dy: qy / qs, s: qz / qs } : null, tight, raw: gT[st.lg],
+    cands: [st.lg, ...top.filter(g => g !== st.lg)].slice(0, 5).map(g => ({ label: labels[g === st.lg ? st.rep : gB[g]], prob: gT[g] * sc }))
+  };
+}
+
+/* ---------- live frame loop: one pass per camera frame ---------- */
 const color = label => { let h = 0; for (const c of label) h = (h * 31 + c.charCodeAt(0)) % 360; return `hsl(${h} 85% 55%)`; };
 function tag(text, x, y, col) {
   ctx.font = "600 15px system-ui, sans-serif";
@@ -2379,63 +2531,126 @@ function tag(text, x, y, col) {
   ctx.fillStyle = col; ctx.fillRect(x, ty, tw, 22); ctx.fillStyle = "#000"; ctx.fillText(text, x + 5, ty + 16);
 }
 const square = (cx, cy, side, W, H) => { const s = Math.min(side, W, H); return { x: Math.max(0, Math.min(W - s, cx - s / 2)), y: Math.max(0, Math.min(H - s, cy - s / 2)), s }; };
+const setHtml = (el, h) => { if (el._h !== h) { el._h = h; el.innerHTML = h; } };
+const setTxt = (el, t) => { if (el._t !== t) { el._t = t; el.textContent = t; } };
 
-function loop() {
-  requestAnimationFrame(loop);
-  if (video.currentTime === lastTime) return;
-  lastTime = video.currentTime;
+/* Where could the object be? The hand tracker only knows the HAND, so we look at several spots around it:
+   in the grip, just beyond the fingertips (pen tip, scissor blades), behind the palm (bottom of a bottle), a wide view,
+   plus any tight box from the object detector that touches the hand. CLIP then tells us which spot actually holds a thing. */
+function buildProps(pts, b, side, W, H, liveDets) {
+  const m = Math.min(W, H), avg = ix => { let x = 0, y = 0; for (const i of ix) { x += pts[i].x; y += pts[i].y; } return { x: x / ix.length, y: y / ix.length }; };
+  const palm = avg([0, 5, 9, 13, 17]), tips = avg([4, 8, 12, 16, 20]), hc = { x: b.x + b.w / 2, y: b.y + b.h / 2 };
+  let ax = pts[9].x - pts[0].x, ay = pts[9].y - pts[0].y; const al = Math.hypot(ax, ay) || 1; ax /= al; ay /= al;
+  const ref = Math.max(side, 0.2 * m), P = [];
+  const g = 0.35 * side, hb = { x: b.x - g, y: b.y - g, w: b.w + 2 * g, h: b.h + 2 * g };
+  liveDets.filter(d => d.score >= 0.25).map(d => {
+    const ix = Math.max(0, Math.min(d.x + d.w, hb.x + hb.w) - Math.max(d.x, hb.x)), iy = Math.max(0, Math.min(d.y + d.h, hb.y + hb.h) - Math.max(d.y, hb.y));
+    return { d, ov: ix * iy / Math.max(1, d.w * d.h) };
+  }).filter(o => o.ov > 0.25).sort((u, v) => v.d.score - u.d.score).slice(0, 2).forEach(o => {
+    const d = o.d, lab = COCO[d.name];
+    P.push({ k: "det", ...square(d.x + d.w / 2, d.y + d.h / 2, Math.max(Math.max(d.w, d.h) * 1.25, 0.16 * m), W, H),
+      det: lab && labelIx.has(lab) ? { lab, score: d.score, tight: { x: d.x, y: d.y, w: d.w, h: d.h } } : null });
+  });
+  P.push({ k: "grip",   ...square((palm.x + tips.x) / 2, (palm.y + tips.y) / 2, ref * 1.15, W, H) });
+  P.push({ k: "beyond", ...square(tips.x + ax * ref * 0.5, tips.y + ay * ref * 0.5, ref * 1.1, W, H) });
+  P.push({ k: "behind", ...square(palm.x - ax * ref * 0.45, palm.y - ay * ref * 0.45, ref * 1.1, W, H) });
+  P.push({ k: "wide",   ...square(hc.x, hc.y, Math.max(ref * 2.2, 0.4 * m), W, H) });
+  return P;
+}
+
+function onFrame() {
+  schedule();
+  if (!handLm) return;
+  if (!video.requestVideoFrameCallback) { if (video.currentTime === lastTime) return; lastTime = video.currentTime; }
   const W = canvas.width, H = canvas.height, now = performance.now();
-  ctx.save(); ctx.translate(W, 0); ctx.scale(-1, 1); ctx.drawImage(video, 0, 0, W, H); ctx.restore();
-  cleanCtx.drawImage(video, 0, 0, W, H);
-
   let ts = now; if (ts <= lastTs) ts = lastTs + 1; lastTs = ts;
   const hands = handLm.detectForVideo(video, ts).landmarks || [];
-  hs.length = hands.length;
+  ctx.clearRect(0, 0, W, H);                       // the video itself is shown by the <video> element (smooth, GPU composited)
 
-  let main = null, mainConf = 0, candTxt = "", sawEmpty = false;
+  for (const s of hs) if (s) s.live = false;
+  // when fingers wrap an object the tracker blinks for a few frames - keep the votes instead of throwing them away
+  if (hands.length) { hs.length = hands.length; lostT = 0; } else { if (!lostT) lostT = now; if (now - lostT > 700) hs.length = 0; }
+  const evNow = (pending || tickOn) ? (frozenAt || (frozenAt = now)) : (frozenAt = 0, now);   // while the notification is open the name stays put
+
+  // object detector (tight boxes for scissors / bottle / phone ...) - every 3rd frame is plenty
+  if (objDet && (frameN++ % 3 === 0)) {
+    try {
+      let t2 = now; if (t2 <= lastTsD) t2 = lastTsD + 1; lastTsD = t2;
+      dets = (objDet.detectForVideo(video, t2).detections || []).map(d => { const bb = d.boundingBox, c = d.categories[0]; return { x: W - (bb.originX + bb.width), y: bb.originY, w: bb.width, h: bb.height, name: c.categoryName, score: c.score }; })
+        .filter(d => !DET_SKIP.has(d.name) && d.w * d.h < 0.4 * W * H);
+      detT = now;
+    } catch (e) { console.warn("object finder failed", e); objDet = null; }
+  }
+  const liveDets = now - detT < 600 ? dets : [];
+
+  let main = null, mainP = 0, mainSure = false, ann = null, annP = 0, candTxt = "", sawEmpty = false;
   hands.forEach((lm, i) => {
-    const st = hs[i] || (hs[i] = { box: null, hist: [], leader: -1, win: null });
+    const st = hs[i] || (hs[i] = { box: null, hist: [], lg: -1, rep: -1, props: null, res: null, resT: 0, ob: null });
+    st.live = true;
+    const pts = lm.map(p => ({ x: (1 - p.x) * W, y: p.y * H }));
     let x1 = 1e9, y1 = 1e9, x2 = -1e9, y2 = -1e9;
-    for (const p of lm) { const x = (1 - p.x) * W, y = p.y * H; if (x < x1) x1 = x; if (x > x2) x2 = x; if (y < y1) y1 = y; if (y > y2) y2 = y; }
-    const raw = { x: x1, y: y1, w: x2 - x1, h: y2 - y1 };
-    { const c = { x: raw.x + raw.w / 2, y: raw.y + raw.h / 2 }; if (st.c) st.sp = (st.sp || 0) * 0.7 + 0.3 * Math.hypot(c.x - st.c.x, c.y - st.c.y) / Math.max(raw.w, raw.h, 1); st.c = c; }
-    if (!st.box) st.box = { ...raw }; else for (const k of ["x", "y", "w", "h"]) st.box[k] += (raw[k] - st.box[k]) * 0.5;   // smooth, no jitter
-    const b = st.box, side = Math.max(b.w, b.h), cx = b.x + b.w / 2, cy = b.y + b.h / 2, m = Math.min(W, H);
-    st.win = [square(cx, cy, Math.max(side * 1.45, 0.26 * m), W, H), square(cx, cy, Math.max(side * 1.9, 0.34 * m), W, H), square(cx, cy, Math.max(side * 2.6, 0.46 * m), W, H)];
-
-    // Average the probabilities of all recent looks (newer ones count more) -> ranking that does not flicker
-    st.hist = st.hist.filter(h => now - h.t < 3500 && h.p.length === labels.length);
-    const nL = labels.length, acc = new Float32Array(nL); let wsum = 0, emp = 0;
-    for (const h of st.hist) { const w = Math.exp(-(now - h.t) / 1500); wsum += w; emp += w * h.e; for (let j = 0; j < nL; j++) acc[j] += w * h.p[j]; }
-    if (wsum > 0) { for (let j = 0; j < nL; j++) acc[j] /= wsum; emp /= wsum; }
-    const order = Array.from(acc.keys()).sort((x, y) => acc[y] - acc[x]).slice(0, 5);
-    // the leader only changes when a challenger is clearly better (+20 %)
-    if (order.length && wsum > 0) {
-      const ch = order[0];
-      if (st.leader < 0 || st.leader >= nL || acc[ch] > acc[st.leader] * 1.35) st.leader = ch;
+    for (const p of pts) { if (p.x < x1) x1 = p.x; if (p.x > x2) x2 = p.x; if (p.y < y1) y1 = p.y; if (p.y > y2) y2 = p.y; }
+    const raw = { x: x1, y: y1, w: x2 - x1, h: y2 - y1 }, c = { x: raw.x + raw.w / 2, y: raw.y + raw.h / 2 };
+    if (st.c && st.ob) { st.ob.x += c.x - st.c.x; st.ob.y += c.y - st.c.y; }   // the box rides with the hand
+    if (st.c) st.sp = (st.sp || 0) * 0.7 + 0.3 * Math.hypot(c.x - st.c.x, c.y - st.c.y) / Math.max(raw.w, raw.h, 1); st.c = c;
+    // adaptive smoothing: a still hand gets a steady box, a moving hand gets a box that is glued to it (no trailing)
+    if (!st.box) st.box = { ...raw };
+    else {
+      const bb = st.box, d = Math.hypot(c.x - (bb.x + bb.w / 2), c.y - (bb.y + bb.h / 2)) / Math.max(raw.w, raw.h, 40), a = Math.min(1, 0.4 + d * 14);
+      for (const k of ["x", "y", "w", "h"]) bb[k] += (raw[k] - bb[k]) * a;
     }
-    const lead = wsum > 0 && st.leader >= 0 ? st.leader : -1;
-    const isEmpty = wsum > 0 && emp > 0.5, thr = +$("thr").value;
-    const shown = lead >= 0 && !isEmpty && st.hist.length >= 2 && acc[lead] >= thr && (order.length < 2 || acc[lead] >= 1.15 * acc[order.find(j => j !== lead)]) ? labels[lead] : null, conf = shown ? acc[lead] : 0;
-    st.cands = wsum > 0 ? [lead, ...order.filter(j => j !== lead)].slice(0, 5).filter(j => j >= 0).map(j => ({ label: labels[j], prob: acc[j] })) : null;
+    const b = st.box, side = Math.max(b.w, b.h);
+    st.props = buildProps(pts, b, side, W, H, liveDets);
+
+    if (!st.resT || now - st.resT > 90) { st.res = evaluate(st, evNow); st.resT = now; }
+    const r = st.res;
+    const shown = r && !r.isEmpty && r.p >= thr ? r.name : null;                       // name appears as soon as it passes the slider
+    const sure = !!shown && r.p >= 0.35 && r.margin >= 1.4 && r.n >= 2;                // solid box = confident, dashed + "?" = best guess
     const col = shown ? color(shown) : "#cbd5e1";
+    st.cands = r ? r.cands : null;
 
+    // the HAND: thin grey outline + dots, never the label
     const pad = 0.12 * side, hx = Math.max(0, b.x - pad), hy = Math.max(0, b.y - pad), hw = Math.min(W, b.x + b.w + pad) - hx, hh = Math.min(H, b.y + b.h + pad) - hy;
-    if (shown) { ctx.fillStyle = col.replace(")", " / 0.16)"); ctx.fillRect(hx, hy, hw, hh); }
-    ctx.strokeStyle = col; ctx.lineWidth = 3; ctx.setLineDash(shown ? [] : [6, 5]); ctx.strokeRect(hx, hy, hw, hh); ctx.setLineDash([]);
-    tag(shown ? `${shown} ${(conf * 100) | 0}%` : (isEmpty ? "empty hand" : (ready ? "looking…" : "loading AI…")), hx, hy, col);
+    ctx.strokeStyle = "rgba(203,213,225,.45)"; ctx.lineWidth = 1.5; ctx.setLineDash([3, 5]); ctx.strokeRect(hx, hy, hw, hh); ctx.setLineDash([]);
+    ctx.fillStyle = "rgba(255,255,255,.55)"; for (const p of pts) { ctx.beginPath(); ctx.arc(p.x, p.y, 2.2, 0, 6.2832); ctx.fill(); }
 
-    if (isEmpty) sawEmpty = true;
-    if (shown && conf >= mainConf) { mainConf = conf; main = shown; }
-    if (st.cands && !candTxt) candTxt = (isEmpty ? "Looks empty · " : "") + st.cands.map((x, k) => `${k + 1}. ${x.label} ${(x.prob * 100) | 0}%`).join("   ");
+    // the OBJECT: coloured box where the object is (tight detector box when available, otherwise the spot where the AI saw it)
+    let ob = null;
+    if (shown && r.box) {
+      let t;
+      if (r.tight) { const q = 0.06 * Math.max(r.tight.w, r.tight.h); t = { x: c.x + r.tight.dx - r.tight.w / 2 - q, y: c.y + r.tight.dy - r.tight.h / 2 - q, w: r.tight.w + 2 * q, h: r.tight.h + 2 * q }; }
+      else { const s2 = Math.max(side, 0.2 * Math.min(W, H)) * 0.9; t = { x: c.x + r.box.dx - s2 / 2, y: c.y + r.box.dy - s2 / 2, w: s2, h: s2 }; }   // constant size: only the position is searched
+      if (!st.ob) st.ob = { ...t };
+      else {
+        const o = st.ob, d = Math.hypot(t.x + t.w / 2 - (o.x + o.w / 2), t.y + t.h / 2 - (o.y + o.h / 2));
+        if (d > 0.18 * o.w) { const a = 0.14; for (const k of ["x", "y", "w", "h"]) o[k] += (t[k] - o[k]) * a; }      // only moves when the new spot is clearly different
+        else { o.w += (t.w - o.w) * 0.05; o.h += (t.h - o.h) * 0.05; }
+      }
+      ob = st.ob;
+    } else if (!shown) st.ob = null;
+    if (ob) {
+      if (sure) { ctx.fillStyle = col.replace(")", " / 0.16)"); ctx.fillRect(ob.x, ob.y, ob.w, ob.h); }
+      ctx.strokeStyle = col; ctx.lineWidth = 3; ctx.setLineDash(sure ? [] : [6, 5]); ctx.strokeRect(ob.x, ob.y, ob.w, ob.h); ctx.setLineDash([]);
+      tag(`${shown}${sure ? "" : "?"} ${Math.round(r.p * 100)}%`, ob.x, ob.y, col);
+    } else {
+      tag(shown ? `${shown}${sure ? "" : "?"} ${Math.round(r.p * 100)}%` : (r && r.isEmpty ? "empty hand" : (ready ? "looking…" : "loading AI…")), hx, hy, col);
+    }
+
+    if (r && r.isEmpty) sawEmpty = true;
+    if (shown && r.p >= mainP) { mainP = r.p; main = shown; mainSure = sure; }
+    // a grip is only proposed for a stable, reasonably confident name
+    if (shown && r.raw >= Math.max(thr, 0.22) && r.margin >= 1.15 && r.n >= 3 && r.raw >= annP) { annP = r.raw; ann = shown; }
+    if (r && !candTxt) candTxt = (r.isEmpty ? "Looks empty · " : "") + r.cands.map((x, k) => `${k + 1}. ${x.label} ${Math.round(x.prob * 100)}%`).join("   ");
   });
 
-  track(main, mainConf, hands.length, now);
-  $("result").innerHTML = main ? `${main} <small>${(mainConf * 100) | 0}%</small>` : (!hands.length ? "Show an object in your hand" : (sawEmpty ? "Empty hand" : (ready ? "Looking…" : "Loading AI…")));
-  $("cands").textContent = loadMsg || candTxt;
-
+  track(ann, annP, hands.length, now);
   fps = fps * .9 + (1000 / Math.max(now - prev, 1)) * .1; prev = now;
-  $("hud").textContent = `${fps.toFixed(0)} FPS · ${hands.length} hand${hands.length === 1 ? "" : "s"}` + (inferMs ? ` · AI ${inferMs.toFixed(0)} ms` : "");
+  if (now - lastUI > 100) {                        // DOM text only ~10x/s, and only when it changed
+    lastUI = now;
+    setHtml($("result"), main ? `${esc(main)}${mainSure ? "" : "?"} <small>${Math.round(mainP * 100)}%</small>` : (!hands.length ? "Show an object in your hand" : (sawEmpty ? "Empty hand" : (ready ? "Looking…" : "Loading AI…"))));
+    setTxt($("cands"), loadMsg || candTxt);
+    setTxt($("hud"), `${fps.toFixed(0)} FPS · ${hands.length} hand${hands.length === 1 ? "" : "s"}` + (inferMs ? ` · AI ${inferMs.toFixed(0)} ms${clipOpt ? " " + clipOpt.device : ""}` : ""));
+  }
 }
 
 /* =====================================================================
@@ -2619,14 +2834,10 @@ function showGripInfo(obj, g){
 }
 async function moveHand(f, ms){
   await rigReady;
-  window.__rigBusyUntil = performance.now() + (ms || 900) + 2500;
   const from = window.HandRig.currentPose(), to = Object.assign({}, from);
   FINGERS.forEach((k, i) => to[k] = f[i]);
   return window.HandRig.tweenTo(from, to, ms || 900, null);
 }
-
-["pointerdown","wheel","touchstart"].forEach(ev => $("viewport").addEventListener(ev, () => { window.__rigBusyUntil = performance.now() + 3000; }, { passive:true }));
-$("viewport").addEventListener("pointermove", e => { if (e.buttons) window.__rigBusyUntil = performance.now() + 3000; }, { passive:true });
 
 /* ---- 6. "Found position" notification + press to close ---- */
 const notif = $("notif");
@@ -2657,7 +2868,7 @@ function track(label, conf, hands, now){
   if (label){
     st.lostSince = 0;
     if (label !== st.label){ st.label = label; st.since = now; }
-    else if (now - st.since > 1500 && label !== st.announced) announce(label);
+    else if (now - st.since > 700 && label !== st.announced) announce(label);
   } else {
     st.label = null;
     if (!st.lostSince) st.lostSince = now;
