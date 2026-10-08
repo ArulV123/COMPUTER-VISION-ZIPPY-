@@ -230,7 +230,7 @@
         </div>
         <div class="panel bar">
           <label>Extra objects <input class="plain" id="extra" type="text" placeholder="e.g. earbuds case, rubik's cube"></label>
-          <label>Min confidence <input id="thr" type="range" min="0.1" max="0.9" step="0.05" value="0.45"><span id="thrV">0.45</span></label>
+          <label>Min confidence <input id="thr" type="range" min="0.1" max="0.9" step="0.05" value="0.35"><span id="thrV">0.35</span></label>
           <label><input id="wgpu" type="checkbox"> Try WebGPU (faster, reload)</label>
         </div>
       </div>
@@ -1637,11 +1637,11 @@ window.motorOf=function(id,v){
   // tween/playback is actively in flight (playbackActive), force the
   // camera update to run regardless of any earlier manual-drag flag.
   var playbackActive = false;
-  var __lastR = 0;
+  var __lastR = 0; window.__rigBusyUntil = performance.now() + 4000;
   function animate(now){
     requestAnimationFrame(animate);
     now = now || performance.now();
-    if (now - __lastR < 30) return;
+    if (now - __lastR < (now < (window.__rigBusyUntil || 0) ? 30 : 250)) return;
     __lastR = now;
     updateGyroCube(); // keep the stable cube tracking the joint's position every frame, regardless of which slider moved
     if (playbackActive || (autoFocusEnabled && autoFocusActive)){
@@ -2249,6 +2249,7 @@ $("thr").oninput = () => $("thrV").textContent = (+$("thr").value).toFixed(2);
 /* ---------- CLIP (local) ---------- */
 let tokenizer, processor, textModel, visionModel, labels = [], rowKinds = [], rowLabel = [], textEmb = null, D = 512;
 env.allowLocalModels = false; env.useBrowserCache = true;
+try { env.backends.onnx.wasm.proxy = true; } catch {}
 try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch {}
 let clipOpt = null;
 const progressCb = p => { if (p.status === "progress" && p.file) loadMsg = store.get("clipCached") === "1" ? "Loading AI model from cache…" : `Downloading ${p.file.split("/").pop()} ${Math.round(p.progress || 0)}%`; };
@@ -2264,7 +2265,7 @@ async function loadClip() {
       clipOpt = opt;
       visionModel = await CLIPVisionModelWithProjection.from_pretrained(CLIP_ID, { ...opt, progress_callback: progressCb });
       return;
-    } catch (e) { console.warn(e); err = e; }
+    } catch (e) { console.warn(e); err = e; try { env.backends.onnx.wasm.proxy = false; } catch {} }
   }
   throw err;
 }
@@ -2355,7 +2356,7 @@ async function classifyLoop() {
     const n = hs.length;
     if (!ready || !n || pending || tickOn) { await sleep(120); continue; }
     const i = turn % n, st = hs[i], view = (turn / n | 0) % 3; turn++;
-    if (!st || !st.win || st.sp > 0.06) { await sleep(40); continue; }
+    if (!st || !st.win || st.sp > 0.1) { await sleep(40); continue; }
     const w = st.win[view];
     cctx.fillStyle = "#808080"; cctx.fillRect(0, 0, 224, 224);
     cctx.drawImage(clean, clean.width - w.x - w.s, w.y, w.s, w.s, 0, 0, 224, 224);
@@ -2415,7 +2416,7 @@ function loop() {
     }
     const lead = wsum > 0 && st.leader >= 0 ? st.leader : -1;
     const isEmpty = wsum > 0 && emp > 0.5, thr = +$("thr").value;
-    const shown = lead >= 0 && !isEmpty && st.hist.length >= 4 && acc[lead] >= thr && (order.length < 2 || acc[lead] >= 1.4 * acc[order.find(j => j !== lead)]) ? labels[lead] : null, conf = shown ? acc[lead] : 0;
+    const shown = lead >= 0 && !isEmpty && st.hist.length >= 2 && acc[lead] >= thr && (order.length < 2 || acc[lead] >= 1.15 * acc[order.find(j => j !== lead)]) ? labels[lead] : null, conf = shown ? acc[lead] : 0;
     st.cands = wsum > 0 ? [lead, ...order.filter(j => j !== lead)].slice(0, 5).filter(j => j >= 0).map(j => ({ label: labels[j], prob: acc[j] })) : null;
     const col = shown ? color(shown) : "#cbd5e1";
 
@@ -2618,10 +2619,14 @@ function showGripInfo(obj, g){
 }
 async function moveHand(f, ms){
   await rigReady;
+  window.__rigBusyUntil = performance.now() + (ms || 900) + 2500;
   const from = window.HandRig.currentPose(), to = Object.assign({}, from);
   FINGERS.forEach((k, i) => to[k] = f[i]);
   return window.HandRig.tweenTo(from, to, ms || 900, null);
 }
+
+["pointerdown","wheel","touchstart"].forEach(ev => $("viewport").addEventListener(ev, () => { window.__rigBusyUntil = performance.now() + 3000; }, { passive:true }));
+$("viewport").addEventListener("pointermove", e => { if (e.buttons) window.__rigBusyUntil = performance.now() + 3000; }, { passive:true });
 
 /* ---- 6. "Found position" notification + press to close ---- */
 const notif = $("notif");
